@@ -9,6 +9,7 @@ from datetime import date, datetime, time
 
 import frappe
 from frappe import _
+from frappe.core.doctype.data_import.exporter import reject_nested_table_import_export
 from frappe.core.doctype.version.version import get_diff
 from frappe.model import no_value_fields
 from frappe.utils import cint, cstr, duration_to_seconds, flt, update_progress_bar
@@ -31,6 +32,7 @@ class Importer:
 		self, doctype, data_import=None, file_path=None, import_type=None, console=False, use_sniffer=False
 	):
 		self.doctype = doctype
+		reject_nested_table_import_export(frappe.get_meta(doctype))
 		self.console = console
 		self.use_sniffer = use_sniffer
 

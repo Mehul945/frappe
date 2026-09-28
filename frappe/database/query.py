@@ -234,6 +234,7 @@ class Engine:
 		ignore_user_permissions: bool = False,
 		user: str | None = None,
 		parent_doctype: str | None = None,
+		root_doctype: str | None = None,
 		reference_doctype: str | None = None,
 		or_filters: dict[str, FilterValue] | FilterValue | list[list | FilterValue] | None = None,
 		db_query_compat: bool = False,
@@ -245,6 +246,7 @@ class Engine:
 			This is kept optional to not break existing code that relies on the original query builder behaviour.
 			ignore_user_permissions: Ignore user permissions for the query.
 				Useful for link search queries when the link field has `ignore_user_permissions` set.
+			root_doctype: Root DocType when the immediate child parent is used by multiple roots.
 			validate_filters: DEPRECATED. Will be removed in future versions.
 		"""
 
@@ -256,6 +258,20 @@ class Engine:
 		self.is_sqlite = db_type == "sqlite"
 		self.user = user or frappe.session.user
 		self.parent_doctype = parent_doctype
+		self.explicit_root_doctype = root_doctype
+		self.nested_parent_doctype = None
+		if parent_doctype and (not ignore_permissions or root_doctype) and frappe.get_meta(parent_doctype).istable:
+			if not ignore_permissions:
+				from frappe.permissions import get_nested_child_root_doctype
+
+				self.nested_parent_doctype = parent_doctype
+				self.root_doctype = get_nested_child_root_doctype(parent_doctype, root_doctype)
+			else:
+				self.root_doctype = root_doctype
+		else:
+			if root_doctype:
+				frappe.throw(_("root_doctype requires a child-table parent_doctype"), frappe.ValidationError)
+			self.root_doctype = parent_doctype
 		self.reference_doctype = reference_doctype
 		self.apply_permissions = not ignore_permissions
 		self.ignore_user_permissions = ignore_user_permissions
@@ -276,7 +292,7 @@ class Engine:
 
 		if self.apply_permissions:
 			self.check_select_permission()
-			self.permission_doctype = parent_doctype or self.doctype
+			self.permission_doctype = self.root_doctype or self.doctype
 			self.permission_table = (
 				qb.DocType(self.permission_doctype) if self.permission_doctype != self.doctype else self.table
 			)
@@ -340,7 +356,7 @@ class Engine:
 		if self.apply_permissions:
 			# Store metadata for masked field processing during execution.
 			self.query._doctype = self.doctype
-			self.query._parent_doctype = self.parent_doctype
+			self.query._parent_doctype = self.root_doctype
 			self.query._fields_list = getattr(self, "fields", [])
 
 		self.query.immutable = True
@@ -868,7 +884,7 @@ class Engine:
 			# It's a simple, valid fieldname like 'name' or 'creation'
 			target_doctype = doctype or self.doctype
 			target_fieldname = field
-			parent_doctype_for_perm = self.parent_doctype if doctype else None
+			parent_doctype_for_perm = self.root_doctype if doctype else None
 
 			# If a specific doctype is provided and it's different from the main query doctype,
 			# if it's a child table, add the join using ChildTableField logic
@@ -974,6 +990,10 @@ class Engine:
 
 		# Skip field permission check if doctype has no permissions defined
 		meta = frappe.get_meta(doctype)
+		if doctype == self.doctype and meta.istable and not parent_doctype:
+			parent_doctype = self.root_doctype
+		elif parent_doctype == self.doctype and frappe.get_meta(self.doctype).istable:
+			parent_doctype = self.root_doctype
 		if not meta.get_permissions(parenttype=parent_doctype):
 			return
 
@@ -1377,9 +1397,21 @@ class Engine:
 
 	def check_select_permission(self):
 		"""Check if user has select (or read) permission on the doctype"""
-		if not frappe.has_permission(
-			self.doctype, "select", user=self.user, parent_doctype=self.parent_doctype
-		):
+		if self.nested_parent_doctype and self.explicit_root_doctype:
+			from frappe.permissions import has_child_permission
+
+			allowed = has_child_permission(
+				self.doctype,
+				"select",
+				user=self.user,
+				parent_doctype=self.nested_parent_doctype,
+				_root_doctype=self.explicit_root_doctype,
+			)
+		else:
+			allowed = frappe.has_permission(
+				self.doctype, "select", user=self.user, parent_doctype=self.parent_doctype
+			)
+		if not allowed:
 			self._raise_permission_error()
 
 	def _raise_permission_error(self, doctype=None):
@@ -1392,10 +1424,10 @@ class Engine:
 	def apply_field_permissions(self):
 		"""Filter the list of fields based on permlevel."""
 		allowed_fields = []
-		parent_permission_type = self.get_permission_type(self.doctype)
+		parent_permission_type = self.get_permission_type(self.doctype, self.root_doctype)
 
 		permitted_fields_set = self._get_cached_permitted_fields(
-			self.doctype, self.parent_doctype, parent_permission_type
+			self.doctype, self.root_doctype, parent_permission_type
 		)
 
 		for field in self.fields:
@@ -1445,20 +1477,24 @@ class Engine:
 
 				parent_meta = frappe.get_meta(self.doctype)
 				if parent_meta.get_field(field.fieldname).permlevel not in parent_meta.get_permlevel_access(
-					parent_permission_type, user=self.user
+					parent_permission_type,
+					parenttype=self.root_doctype if parent_meta.istable else None,
+					user=self.user,
 				):
 					continue
 
 				# Cache permitted fields for the child doctype of the query
+				permission_parent = self.root_doctype if parent_meta.istable else field.parent_doctype
 				permitted_child_fields_set = self._get_cached_permitted_fields(
 					field.doctype,
-					field.parent_doctype,
-					self.get_permission_type(field.doctype, field.parent_doctype),
+					permission_parent,
+					self.get_permission_type(field.doctype, permission_parent),
 				)
 				# Filter the fields *within* the ChildQuery object based on permissions
 				field.fields = [f for f in field.fields if f in permitted_child_fields_set]
 				# Only add the child query if it still has fields after filtering
 				if field.fields:
+					field.permission_parent_doctype = permission_parent
 					allowed_fields.append(field)
 			elif isinstance(field, Field):
 				if field.name == "*":
@@ -1552,10 +1588,9 @@ class Engine:
 
 		For child tables (when parent_doctype is specified):
 			- permissions are checked against the parent doctype
-			- for non-single parent doctypes: a join to the parent table is added,
-		                conditions reference parent fields
-			- for single parent doctypes: all permissions are already checked by has_permission,
-		                we exit early without adding any conditions
+			- rows are limited to parent Table fields the user can read
+			- non-Single parents are joined to apply document permissions
+			- Single parents need no join after the Table field check
 		"""
 
 		if not self.apply_permissions:
@@ -1563,14 +1598,66 @@ class Engine:
 
 		if self.permission_doctype != self.doctype:
 			parent_meta = frappe.get_meta(self.permission_doctype)
-			if parent_meta.issingle:
-				# Child table of single doctype
-				# permissions are already checked by has_permission
-				return
+			if self.nested_parent_doctype:
+				from frappe.permissions import get_nested_child_permlevels
 
-			self.query = self.query.inner_join(self.permission_table).on(
-				self.table.parent == self.permission_table.name
-			)
+				intermediate_meta = frappe.get_meta(self.nested_parent_doctype)
+				intermediate = frappe.qb.DocType(self.nested_parent_doctype)
+				permitted_levels = get_nested_child_permlevels(self.permission_doctype, "read", self.user)
+				valid_nested_fields = [
+					df.fieldname
+					for df in intermediate_meta.get_table_fields()
+					if df.fieldtype == "Table"
+					and df.options == self.doctype
+					and not df.is_virtual
+					and df.permlevel in permitted_levels
+				]
+				valid_root_fields = [
+					df.fieldname
+					for df in parent_meta.get_table_fields()
+					if df.fieldtype == "Table"
+					and df.options == self.nested_parent_doctype
+					and not df.is_virtual
+					and df.permlevel in permitted_levels
+				]
+				self.query = self.query.inner_join(intermediate).on(
+					(self.table.parent == intermediate.name)
+					& (self.table.parenttype == self.nested_parent_doctype)
+					& self.table.parentfield.isin(valid_nested_fields)
+				)
+				if parent_meta.issingle:
+					self.query = self.query.where(
+						(intermediate.parent == self.permission_doctype)
+						& (intermediate.parenttype == self.permission_doctype)
+						& intermediate.parentfield.isin(valid_root_fields)
+					)
+					return
+				self.query = self.query.inner_join(self.permission_table).on(
+					(intermediate.parent == self.permission_table.name)
+					& (intermediate.parenttype == self.permission_doctype)
+					& intermediate.parentfield.isin(valid_root_fields)
+				)
+			else:
+				from frappe.permissions import get_nested_child_permlevels
+
+				permitted_levels = get_nested_child_permlevels(self.permission_doctype, "read", self.user)
+				valid_parentfields = [
+					df.fieldname
+					for df in parent_meta.get_table_fields(include_computed=True)
+					if df.options == self.doctype and df.permlevel in permitted_levels
+				]
+				if parent_meta.issingle:
+					self.query = self.query.where(
+						(self.table.parent == self.permission_doctype)
+						& (self.table.parenttype == self.permission_doctype)
+						& self.table.parentfield.isin(valid_parentfields)
+					)
+					return
+				self.query = self.query.inner_join(self.permission_table).on(
+					(self.table.parent == self.permission_table.name)
+					& (self.table.parenttype == self.permission_doctype)
+					& self.table.parentfield.isin(valid_parentfields)
+				)
 
 		if condition := self.get_permission_conditions(self.permission_doctype, self.permission_table):
 			self.query = self.query.where(condition)
@@ -2041,12 +2128,38 @@ class ChildTableField(DynamicTableField):
 
 	def apply_join(self, query: QueryBuilder, engine: "Engine" = None) -> QueryBuilder:
 		main_table = frappe.qb.DocType(self.parent_doctype)
+		permitted_parentfields = None
+		if engine and engine.apply_permissions and engine.user != "Administrator":
+			from frappe.permissions import get_nested_child_permlevels
+
+			parent_meta = frappe.get_meta(self.parent_doctype)
+			root_doctype = engine.root_doctype if parent_meta.istable else self.parent_doctype
+			permitted_levels = get_nested_child_permlevels(root_doctype, "read", engine.user)
+			permitted_parentfields = [
+				df.fieldname
+				for df in parent_meta.get_table_fields()
+				if df.options == self.doctype and not df.is_virtual and df.permlevel in permitted_levels
+			]
+			if self.parent_fieldname and self.parent_fieldname not in permitted_parentfields:
+				frappe.throw(
+					_("You do not have permission to access field: {0}").format(
+						frappe.bold(f"{self.parent_doctype}.{self.parent_fieldname}")
+					),
+					frappe.PermissionError,
+				)
+			if not permitted_parentfields:
+				frappe.throw(
+					_("You do not have permission to access child table: {0}").format(frappe.bold(self.doctype)),
+					frappe.PermissionError,
+				)
 		if not query.is_joined(self.table):
 			join_conditions = (self.table.parent == main_table.name) & (
 				self.table.parenttype == self.parent_doctype
 			)
 			if self.parent_fieldname:
 				join_conditions &= self.table.parentfield == self.parent_fieldname
+			elif permitted_parentfields is not None:
+				join_conditions &= self.table.parentfield.isin(permitted_parentfields)
 			query = query.left_join(self.table).on(join_conditions)
 		return query
 
