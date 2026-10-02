@@ -48,6 +48,34 @@ context("Nested child table", () => {
 		cy.login();
 	});
 
+	it("clears grandchildren when sync replaces a child row", () => {
+		const title = `Nested row replacement ${Date.now()}`;
+		cy.insert_doc(root_doctype, {
+			title,
+			rows: [{ details: [{ value: "old detail" }] }],
+		});
+		cy.visit(`/desk/nested-grid-test-parent/${encodeURIComponent(title)}`);
+		cy.window().then(({ cur_frm, frappe, locals }) => {
+			const row = cur_frm.doc.rows[0];
+			const old_name = row.name;
+			const detail_name = row.details[0].name;
+			const new_name = `replacement-${Date.now()}`;
+			const updated_doc = {
+				...cur_frm.doc,
+				rows: [{ ...row, name: new_name, details: [] }],
+			};
+
+			frappe.model.sync(updated_doc);
+
+			expect(cur_frm.doc.rows[0]).to.equal(row);
+			expect(row.name).to.equal(new_name);
+			expect(row.details).to.have.length(0);
+			expect(locals[child_doctype][old_name]).to.be.undefined;
+			expect(locals[child_doctype][new_name]).to.equal(row);
+			expect(locals[grandchild_doctype][detail_name]).to.be.undefined;
+		});
+	});
+
 	it("adds and removes grandchildren in the expanded row and survives reload", () => {
 		const title = `Nested grid ${Date.now()}`;
 		cy.new_form(root_doctype);
