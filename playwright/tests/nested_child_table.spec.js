@@ -107,6 +107,8 @@ test.describe("Nested child table", () => {
 		await value.fill("nested value");
 		await value.blur();
 		await desk.save();
+		await expect(page.locator(".grid-row-open")).toHaveCount(0);
+		await expect.poll(() => page.evaluate(() => frappe.dom.freeze_count)).toBe(0);
 
 		await open_doc(page, desk, title);
 		details = await open_child(page);

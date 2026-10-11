@@ -38,7 +38,7 @@ frappe.ui.form.get_open_grid_form = function () {
 };
 
 frappe.ui.form.close_grid_form = function () {
-	const open_form = frappe.ui.form.get_open_grid_form();
+	const open_form = $(".grid-row-open").first().data("grid_row");
 	open_form && open_form.hide_form();
 
 	// hide editable row too
